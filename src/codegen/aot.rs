@@ -270,12 +270,10 @@ pub fn link_executable(obj_bytes: &[u8], output_path: &str) -> Result<(), String
         output_path.to_string()
     };
 
-    // Intentar enlazar con diferentes compiladores
-    let link_result = try_link_gcc(&obj_path, &runtime_path, &output_path)
-        .or_else(|e1| {
-            try_link_cc(&obj_path, &runtime_path, &output_path)
-                .map_err(|e2| format!("{}\n{}", e1, e2))
-        })
+    // Intentar enlazar con diferentes compiladores (en orden de preferencia)
+    let link_result = try_link_clang(&obj_path, &runtime_path, &output_path)
+        .or_else(|_| try_link_gcc(&obj_path, &runtime_path, &output_path))
+        .or_else(|_| try_link_cc(&obj_path, &runtime_path, &output_path))
         .or_else(|e_prev| {
             if cfg!(target_os = "windows") {
                 try_link_msvc(&obj_path, &runtime_path, &output_path)
@@ -292,7 +290,7 @@ pub fn link_executable(obj_bytes: &[u8], output_path: &str) -> Result<(), String
     match link_result {
         Ok(()) => Ok(()),
         Err(e) => Err(format!(
-            "No se pudo enlazar el ejecutable. Asegúrate de tener un compilador C instalado (gcc, cc, o MSVC).\nDetalles:\n{}",
+            "No se pudo enlazar el ejecutable.\nAsegúrate de tener un compilador C instalado: clang, gcc, cc o MSVC.\nDetalles:\n{}",
             e
         )),
     }
@@ -300,13 +298,24 @@ pub fn link_executable(obj_bytes: &[u8], output_path: &str) -> Result<(), String
 
 fn try_link_gcc(obj_path: &std::path::Path, runtime_path: &std::path::Path, output: &str) -> Result<(), String> {
     use std::process::Command;
+    
+    // Flags específicos por plataforma
+    let (extra_flags, link_flags): (&[&str], &[&str]) = if cfg!(target_os = "macos") {
+        (&["-fPIC"], &["-lm"])
+    } else if cfg!(target_os = "windows") {
+        (&[], &["-lm", "-lpthread"])
+    } else {
+        // Linux y otras POSIX
+        (&["-fPIC"], &["-lm", "-lpthread"])
+    };
+    
     let status = Command::new("gcc")
+        .args(extra_flags)
         .arg(runtime_path)
         .arg(obj_path)
         .arg("-o")
         .arg(output)
-        .arg("-lm")
-        .arg("-lpthread")
+        .args(link_flags)
         .output()
         .map_err(|e| format!("gcc no encontrado: {}", e))?;
 
@@ -320,13 +329,22 @@ fn try_link_gcc(obj_path: &std::path::Path, runtime_path: &std::path::Path, outp
 
 fn try_link_cc(obj_path: &std::path::Path, runtime_path: &std::path::Path, output: &str) -> Result<(), String> {
     use std::process::Command;
+    
+    let (extra_flags, link_flags): (&[&str], &[&str]) = if cfg!(target_os = "macos") {
+        (&["-fPIC"], &["-lm"])
+    } else if cfg!(target_os = "windows") {
+        (&[], &["-lm", "-lpthread"])
+    } else {
+        (&["-fPIC"], &["-lm", "-lpthread"])
+    };
+    
     let status = Command::new("cc")
+        .args(extra_flags)
         .arg(runtime_path)
         .arg(obj_path)
         .arg("-o")
         .arg(output)
-        .arg("-lm")
-        .arg("-lpthread")
+        .args(link_flags)
         .output()
         .map_err(|e| format!("cc no encontrado: {}", e))?;
 
@@ -335,6 +353,35 @@ fn try_link_cc(obj_path: &std::path::Path, runtime_path: &std::path::Path, outpu
     } else {
         let stderr = String::from_utf8_lossy(&status.stderr);
         Err(format!("cc falló: {}", stderr))
+    }
+}
+
+fn try_link_clang(obj_path: &std::path::Path, runtime_path: &std::path::Path, output: &str) -> Result<(), String> {
+    use std::process::Command;
+    
+    let (extra_flags, link_flags): (&[&str], &[&str]) = if cfg!(target_os = "macos") {
+        (&["-fPIC"], &["-lm"])
+    } else if cfg!(target_os = "windows") {
+        (&[], &["-lm", "-lpthread"])
+    } else {
+        (&["-fPIC"], &["-lm", "-lpthread"])
+    };
+    
+    let status = Command::new("clang")
+        .args(extra_flags)
+        .arg(runtime_path)
+        .arg(obj_path)
+        .arg("-o")
+        .arg(output)
+        .args(link_flags)
+        .output()
+        .map_err(|e| format!("clang no encontrado: {}", e))?;
+
+    if status.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&status.stderr);
+        Err(format!("clang falló: {}", stderr))
     }
 }
 
@@ -388,12 +435,169 @@ const RUNTIME_C: &str = r#"
   #include <unistd.h>
 #endif
 
+/* ================================================================
+ * Garbage Collector
+ * ================================================================ */
+
+#define PSC_GC_MAX_ALLOCS 100000
+#define PSC_GC_MAX_GENERATIONS 10
+#define PSC_GC_TEMP_THRESHOLD 1024
+#define PSC_STRING_TABLE_SIZE 16384
+
+typedef enum { GC_PERMANENT, GC_TEMPORARY } GcGeneration;
+
+typedef struct {
+    void* ptr;
+    size_t size;
+    GcGeneration gen;
+    unsigned int age;
+} GcAlloc;
+
+typedef struct {
+    const char* str;
+    unsigned int refcount;
+} GcStringEntry;
+
+typedef struct {
+    GcAlloc* items;
+    size_t count;
+    size_t capacity;
+    size_t total_bytes;
+    size_t temp_bytes;
+    
+    GcStringEntry* string_table;
+    unsigned int string_entries;
+} GcPool;
+
+static GcPool _psc_gc = {NULL, 0, 0, 0, 0, NULL, 0};
+
+void _psc_gc_init(void) {
+    if (!_psc_gc.items) {
+        _psc_gc.capacity = 1024;
+        _psc_gc.items = (GcAlloc*)malloc(sizeof(GcAlloc) * _psc_gc.capacity);
+        memset(_psc_gc.items, 0, sizeof(GcAlloc) * _psc_gc.capacity);
+        
+        _psc_gc.string_table = (GcStringEntry*)malloc(sizeof(GcStringEntry) * PSC_STRING_TABLE_SIZE);
+        memset(_psc_gc.string_table, 0, sizeof(GcStringEntry) * PSC_STRING_TABLE_SIZE);
+        
+        _psc_gc.count = 0;
+        _psc_gc.total_bytes = 0;
+        _psc_gc.temp_bytes = 0;
+        _psc_gc.string_entries = 0;
+    }
+}
+
+static unsigned int _psc_hash_string(const char* s) {
+    unsigned int h = 5381;
+    while (*s) h = ((h << 5) + h) ^ (unsigned char)*s++;
+    return h % PSC_STRING_TABLE_SIZE;
+}
+
+static void _psc_gc_collect_temporaries(void) {
+    if (_psc_gc.temp_bytes < PSC_GC_TEMP_THRESHOLD) return;
+    
+    size_t freed = 0;
+    for (size_t i = 0; i < _psc_gc.count; i++) {
+        if (_psc_gc.items[i].ptr && _psc_gc.items[i].gen == GC_TEMPORARY) {
+            _psc_gc.items[i].age++;
+            if (_psc_gc.items[i].age > PSC_GC_MAX_GENERATIONS) {
+                free(_psc_gc.items[i].ptr);
+                freed += _psc_gc.items[i].size;
+                _psc_gc.items[i].ptr = NULL;
+                _psc_gc.items[i].size = 0;
+            }
+        }
+    }
+    
+    _psc_gc.temp_bytes -= freed;
+}
+
+void* _psc_gc_malloc(size_t size) {
+    _psc_gc_init();
+    
+    if (_psc_gc.count >= PSC_GC_MAX_ALLOCS - 1) {
+        _psc_gc_collect_temporaries();
+    }
+    
+    void* ptr = malloc(size);
+    if (!ptr) return NULL;
+    
+    if (_psc_gc.count >= _psc_gc.capacity) {
+        _psc_gc.capacity *= 2;
+        if (_psc_gc.capacity > PSC_GC_MAX_ALLOCS) _psc_gc.capacity = PSC_GC_MAX_ALLOCS;
+        _psc_gc.items = (GcAlloc*)realloc(_psc_gc.items, sizeof(GcAlloc) * _psc_gc.capacity);
+    }
+    
+    _psc_gc.items[_psc_gc.count].ptr = ptr;
+    _psc_gc.items[_psc_gc.count].size = size;
+    _psc_gc.items[_psc_gc.count].gen = GC_TEMPORARY;
+    _psc_gc.items[_psc_gc.count].age = 0;
+    _psc_gc.count++;
+    
+    _psc_gc.temp_bytes += size;
+    _psc_gc.total_bytes += size;
+    
+    return ptr;
+}
+
+const char* _psc_gc_intern_string(const char* s, size_t len) {
+    if (!s || len == 0) return "";
+    
+    unsigned int h = 5381;
+    for (size_t i = 0; i < len; i++) {
+        h = ((h << 5) + h) ^ (unsigned char)s[i];
+    }
+    h = h % PSC_STRING_TABLE_SIZE;
+    
+    for (size_t i = h; i < PSC_STRING_TABLE_SIZE; i++) {
+        if (!_psc_gc.string_table[i].str) break;
+        if (strncmp(_psc_gc.string_table[i].str, s, len) == 0 &&
+            _psc_gc.string_table[i].str[len] == '\0') {
+            _psc_gc.string_table[i].refcount++;
+            return _psc_gc.string_table[i].str;
+        }
+    }
+    
+    char* p = (char*)_psc_gc_malloc(len + 1);
+    if (!p) return "";
+    memcpy(p, s, len);
+    p[len] = '\0';
+    
+    for (size_t i = h; i < PSC_STRING_TABLE_SIZE; i++) {
+        if (!_psc_gc.string_table[i].str) {
+            _psc_gc.string_table[i].str = p;
+            _psc_gc.string_table[i].refcount = 1;
+            _psc_gc.string_entries++;
+            return p;
+        }
+    }
+    
+    return p;
+}
+
+void _psc_gc_cleanup(void) {
+    if (!_psc_gc.items) return;
+    
+    for (size_t i = 0; i < _psc_gc.count; i++) {
+        if (_psc_gc.items[i].ptr) {
+            free(_psc_gc.items[i].ptr);
+        }
+    }
+    free(_psc_gc.items);
+    free(_psc_gc.string_table);
+    _psc_gc.items = NULL;
+    _psc_gc.string_table = NULL;
+    _psc_gc.count = 0;
+}
+
 /* Punto de entrada del programa PSeInt compilado */
 extern int psc_main(void);
 
 int main(void) {
+    _psc_gc_init();
     int result = psc_main();
-    printf("Programa termin\xC3\xB3 con: %d\n", result);
+    _psc_gc_cleanup();
+    printf("Programa termino con: %d\n", result);
     return 0;
 }
 
@@ -473,11 +677,7 @@ long long builtin_aleatorio(long long a, long long b) {
 /* ---- Cadenas — utilidad interna ---- */
 
 static char* _psc_leak_str(const char* s, size_t len) {
-    char* p = (char*)malloc(len + 1);
-    if (!p) return (char*)"";
-    memcpy(p, s, len);
-    p[len] = '\0';
-    return p;
+    return (char*)_psc_gc_intern_string(s, len);
 }
 
 /* ---- Cadenas — funciones p\xC3\xBAblicas ---- */
@@ -517,7 +717,7 @@ const char* builtin_concatenar(const char* s1, const char* s2) {
     if (!s1) s1 = "";
     if (!s2) s2 = "";
     size_t l1 = strlen(s1), l2 = strlen(s2);
-    char* p = (char*)malloc(l1 + l2 + 1);
+    char* p = (char*)_psc_gc_malloc(l1 + l2 + 1);
     if (!p) return "";
     memcpy(p, s1, l1);
     memcpy(p + l1, s2, l2);
@@ -561,7 +761,8 @@ long long builtin_fechaactual(void) {
 
 long long builtin_alloc_array(long long n) {
     if (n <= 0) n = 1;
-    void* p = calloc((size_t)n, sizeof(long long));
+    void* p = _psc_gc_malloc((size_t)n * sizeof(long long));
+    memset(p, 0, (size_t)n * sizeof(long long));
     return (long long)(size_t)p;
 }
 
@@ -604,8 +805,11 @@ int builtin_wait_key(void) {
     /* Esperar que el usuario presione una tecla */
 #ifdef _WIN32
     system("pause >nul");
+#elif defined(__APPLE__)
+    system("read -n1 -s 2>/dev/null; true");
 #else
-    system("read -n1 -s -r 2>/dev/null || head -c1 >/dev/null");
+    /* Linux y otros POSIX */
+    system("read -n1 -s 2>/dev/null || head -c1 2>/dev/null");
 #endif
     return 0;
 }

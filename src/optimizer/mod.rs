@@ -1,11 +1,5 @@
 
 //! Pase de optimización a nivel AST.
-//!
-//! Se ejecuta antes del codegen y realiza:
-//! - Plegado de constantes (2+3 → 5, "a"+"b" aún no)
-//! - Propagación de constantes (limitada: solo en código lineal)
-//! - Reducción de fuerza (x*2 → x+x, x^2 → x*x)
-//! - Eliminación de código muerto (sentencias inalcanzables después de bucles infinitos, ramas vacías)
 
 use crate::ast::*;
 use std::collections::HashMap;

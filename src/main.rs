@@ -216,16 +216,16 @@ fn main() {
         eprintln!("╔══════════════════════════════════════╗");
         eprintln!("║       Estadísticas de compilación    ║");
         eprintln!("╠══════════════════════════════════════╣");
-        eprintln!("║  Tokens:          {:>6}             ║", token_count);
-        eprintln!("║  Funciones:       {:>6}             ║", program.functions.len());
-        eprintln!("║  Sentencias main: {:>6}             ║", program.main_body.len());
+        eprintln!("║  Tokens:          {:>6}              ║", token_count);
+        eprintln!("║  Funciones:       {:>6}              ║", program.functions.len());
+        eprintln!("║  Sentencias main: {:>6}              ║", program.main_body.len());
         eprintln!("╠──────────────────────────────────────╣");
-        eprintln!("║  Léxico:     {:>10.3?}             ║", lex_time);
-        eprintln!("║  Parsing:    {:>10.3?}             ║", parse_time);
-        eprintln!("║  Semántico:  {:>10.3?}             ║", sema_time);
-        eprintln!("║  Optimizer:  {:>10.3?}             ║", opt_time);
-        eprintln!("║  Codegen:    {:>10.3?}             ║", codegen_time);
-        eprintln!("║  Total:      {:>10.3?}             ║", total_compile);
+        eprintln!("║  Léxico:     {:>10.3?}               ║", lex_time);
+        eprintln!("║  Parsing:    {:>10.3?}               ║", parse_time);
+        eprintln!("║  Semántico:  {:>10.3?}               ║", sema_time);
+        eprintln!("║  Optimizer:  {:>10.3?}               ║", opt_time);
+        eprintln!("║  Codegen:    {:>10.3?}               ║", codegen_time);
+        eprintln!("║  Total:      {:>10.3?}               ║", total_compile);
         eprintln!("╠──────────────────────────────────────╣");
         if args.opt_level >= 1 {
             eprintln!("║  Opt level: {} (AST{})", args.opt_level,
