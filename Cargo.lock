@@ -538,7 +538,7 @@ dependencies = [
 
 [[package]]
 name = "psc"
-version = "1.0.0"
+version = "1.3.0"
 dependencies = [
  "ariadne",
  "chumsky",
@@ -548,6 +548,8 @@ dependencies = [
  "cranelift-module",
  "cranelift-native",
  "cranelift-object",
+ "lazy_static",
+ "libc",
  "logos",
  "target-lexicon",
 ]

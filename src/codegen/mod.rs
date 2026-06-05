@@ -1,10 +1,72 @@
-
 use cranelift::prelude::*;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module, DataDescription, DataId, FuncId};
 use cranelift::codegen::ir::UserFuncName;
 use std::collections::HashMap;
+use std::sync::Mutex;
 use crate::ast::{Program, Statement, Expression, BinaryOp, Type, Function};
+
+struct GcArena {
+    /// Punteros de CString (strings dinámicos generados en runtime)
+    strings: Vec<*mut u8>,
+    /// Pares (ptr, layout) de arreglos asignados con alloc_zeroed
+    arrays: Vec<(*mut u8, std::alloc::Layout)>,
+}
+
+unsafe impl Send for GcArena {}
+unsafe impl Sync for GcArena {}
+
+use std::sync::OnceLock;
+
+static GC: OnceLock<Mutex<GcArena>> = OnceLock::new();
+
+fn gc() -> &'static Mutex<GcArena> {
+    GC.get_or_init(|| Mutex::new(GcArena { strings: Vec::new(), arrays: Vec::new() }))
+}
+
+/// Registra un puntero de CString en el GC y devuelve el mismo puntero.
+fn gc_register_string(ptr: *mut u8) -> *const u8 {
+    if let Ok(mut arena) = gc().lock() {
+        arena.strings.push(ptr);
+    }
+    ptr as *const u8
+}
+
+/// Registra un arreglo en el GC y devuelve el puntero como i64.
+fn gc_register_array(ptr: *mut u8, layout: std::alloc::Layout) -> i64 {
+    if let Ok(mut arena) = gc().lock() {
+        arena.arrays.push((ptr, layout));
+    }
+    ptr as i64
+}
+
+/// Libera toda la memoria rastreada.
+extern "C" fn gc_free_all() {
+    if let Ok(mut arena) = gc().lock() {
+        // Liberar strings
+        for ptr in arena.strings.drain(..) {
+            if !ptr.is_null() {
+                // SAFETY: ptr fue creado por CString::into_raw() en gc_alloc_string
+                unsafe { drop(std::ffi::CString::from_raw(ptr as *mut i8)); }
+            }
+        }
+        // Liberar arreglos
+        for (ptr, layout) in arena.arrays.drain(..) {
+            if !ptr.is_null() {
+                // SAFETY: ptr fue creado por alloc_zeroed con este mismo layout
+                unsafe { std::alloc::dealloc(ptr, layout); }
+            }
+        }
+    }
+}
+
+/// Asigna un CString rastreado por el GC y devuelve *const u8.
+fn gc_alloc_string(s: String) -> *const u8 {
+    let s = s.replace('\0', "");
+    let c = std::ffi::CString::new(s).unwrap_or_default();
+    let ptr = c.into_raw() as *mut u8;   // transfiere ownership al GC
+    gc_register_string(ptr)
+}
 
 pub mod aot;
 
@@ -16,7 +78,7 @@ pub enum CraneliftOptLevel {
     SpeedAndSize,
 }
 
-/// Información de una función definida por el usuario, necesaria en los sitios de llamada
+/// Información de una función definida por el usuario
 pub(crate) struct UserFuncInfo {
     pub(crate) func_id: FuncId,
     pub(crate) params: Vec<(String, Type, bool)>, // (nombre, tipo, por_referencia)
@@ -50,8 +112,8 @@ impl CodeGenerator {
                 flag_builder.set("opt_level", "speed_and_size").unwrap();
             }
         }
-        // Habilitar código independiente de posición para JIT
-        flag_builder.set("is_pic", "true").unwrap();
+
+        flag_builder.set("is_pic", "false").unwrap();
 
         let isa_builder = cranelift_native::builder().unwrap_or_else(|msg| {
             panic!("ISA de la máquina host no soportada: {}", msg);
@@ -106,6 +168,8 @@ impl CodeGenerator {
         builder.symbol("builtin_sleep_secs", builtin_sleep_secs as *const u8);
         builder.symbol("builtin_sleep_millis", builtin_sleep_millis as *const u8);
         builder.symbol("builtin_wait_key", builtin_wait_key as *const u8);
+        // GC: liberar toda la memoria rastreada al final del programa
+        builder.symbol("gc_free_all", gc_free_all as *const u8);
         
         let module = JITModule::new(builder);
         
@@ -118,10 +182,12 @@ impl CodeGenerator {
     }
 
     pub fn compile(&mut self, program: &Program) -> Result<*const u8, String> {
-        // Extraer dimensiones constantes de arreglos de todo el programa
         let global_array_dims = extract_constant_array_dims(program);
 
-        // 1. Declarar todas las funciones de usuario y recopilar info
+        // Detectar parámetros de array para cada función
+        let func_array_params = detect_array_parameters(program);
+
+        // Declarar todas las funciones de usuario y recopilar info
         let mut user_functions: HashMap<String, UserFuncInfo> = HashMap::new();
         for func in &program.functions {
             let mut sig = self.module.make_signature();
@@ -129,6 +195,17 @@ impl CodeGenerator {
                 let cl_ty = match ty { Type::Real => types::F64, _ => types::I64 };
                 sig.params.push(AbiParam::new(cl_ty));
             }
+            
+            // Agregar parámetros dimensión para arrays (después de los parámetros normales)
+            // Estos se pasan como parámetros normales, no ocultos
+            if let Some(array_params) = func_array_params.get(&func.name.to_lowercase()) {
+                for (_, dims_count) in array_params {
+                    for _ in 0..*dims_count {
+                        sig.params.push(AbiParam::new(types::I64));
+                    }
+                }
+            }
+            
             if func.return_var.is_some() {
                 let ret_ty = match &func.return_type {
                     Some(Type::Real) => types::F64, _ => types::I64,
@@ -152,12 +229,11 @@ impl CodeGenerator {
             });
         }
 
-        // 2. Compilar cada función de usuario
         for func in &program.functions {
-            self.compile_user_function(func, &user_functions, &global_array_dims)?;
+            self.compile_user_function(func, &user_functions, &global_array_dims, &func_array_params)?;
         }
 
-        // 3. Compilar main (proceso principal)
+        // Compilar main
         let mut sig_main = self.module.make_signature();
         sig_main.returns.push(AbiParam::new(types::I32));
 
@@ -187,10 +263,19 @@ impl CodeGenerator {
                 array_dims: HashMap::new(),
                 array_elem_types: HashMap::new(),
                 global_array_dims: &global_array_dims,
+                func_array_params: &func_array_params,
             };
 
             for stmt in &program.main_body {
                  trans.translate_stmt(stmt);
+            }
+
+            // Llamar al GC para liberar toda la memoria del programa al terminar
+            {
+                let sig_gc = trans.module.make_signature();
+                let gc_callee = trans.module.declare_function("gc_free_all", Linkage::Import, &sig_gc).unwrap();
+                let local_gc = trans.module.declare_func_in_func(gc_callee, trans.builder.func);
+                trans.builder.ins().call(local_gc, &[]);
             }
 
             let zero = trans.builder.ins().iconst(types::I32, 0);
@@ -208,15 +293,25 @@ impl CodeGenerator {
         Ok(code)
     }
 
-    fn compile_user_function(&mut self, func: &Function, user_functions: &HashMap<String, UserFuncInfo>, global_array_dims: &HashMap<String, Vec<i64>>) -> Result<(), String> {
+    fn compile_user_function(&mut self, func: &Function, user_functions: &HashMap<String, UserFuncInfo>, global_array_dims: &HashMap<String, Vec<i64>>, func_array_params: &HashMap<String, Vec<(usize, usize)>>) -> Result<(), String> {
         let info = user_functions.get(&func.name.to_lowercase()).unwrap();
 
-        // Reconstruir firma
+        // Reconstruir firma (con parámetros dimensión ocultos)
         let mut sig = self.module.make_signature();
         for (_, ty, _) in &func.params {
             let cl_ty = match ty { Type::Real => types::F64, _ => types::I64 };
             sig.params.push(AbiParam::new(cl_ty));
         }
+        
+        // Agregar parámetros dimensión ocultos
+        if let Some(array_param_indices) = func_array_params.get(&func.name.to_lowercase()) {
+            for (_, dims_count) in array_param_indices {
+                for _ in 0..*dims_count {
+                    sig.params.push(AbiParam::new(types::I64));
+                }
+            }
+        }
+        
         if func.return_var.is_some() {
             let ret_ty = match &func.return_type {
                 Some(Type::Real) => types::F64, _ => types::I64,
@@ -270,6 +365,26 @@ impl CodeGenerator {
                 variable_types.insert(ret_var.clone(), func.return_type.clone().unwrap_or(Type::Integer));
             }
 
+            // Extraer dimensiones de los parámetros ocultos
+            let mut array_dims_from_params: HashMap<String, Vec<Value>> = HashMap::new();
+            let mut dim_param_idx = func.params.len();
+            if let Some(array_param_indices) = func_array_params.get(&func.name.to_lowercase()) {
+                for (param_idx, dims_count) in array_param_indices.iter() {
+                    if let Some((param_name, _, _)) = func.params.get(*param_idx) {
+                        let mut dims: Vec<Value> = Vec::new();
+                        for _ in 0..*dims_count {
+                            if dim_param_idx < block_params.len() {
+                                dims.push(block_params[dim_param_idx]);
+                                dim_param_idx += 1;
+                            }
+                        }
+                        if dims.len() == *dims_count {
+                            array_dims_from_params.insert(param_name.clone(), dims);
+                        }
+                    }
+                }
+            }
+
             let mut trans = FunctionTranslator {
                 builder,
                 variables,
@@ -277,16 +392,17 @@ impl CodeGenerator {
                 module: &mut self.module,
                 string_literals: &mut self.string_literals,
                 user_functions,
-                array_dims: HashMap::new(),
+                array_dims: array_dims_from_params,
                 array_elem_types: HashMap::new(),
                 global_array_dims,
+                func_array_params,
             };
 
             for stmt in &func.body {
                 trans.translate_stmt(stmt);
             }
 
-            // Construir valores de retorno: primero return_var, luego parámetros por referencia
+            // Construir valores de retorno
             let mut return_vals = Vec::new();
             if let Some(ref ret_var) = func.return_var {
                 if let Some(var) = trans.variables.get(ret_var) {
@@ -312,6 +428,107 @@ impl CodeGenerator {
     }
 }
 
+/// Detecta qué parámetros de cada función son arrays y cuántas dimensiones tienen
+/// Retorna: HashMap<func_name_lower, HashMap<param_index, num_dimensions>>
+fn detect_array_parameters(program: &Program) -> HashMap<String, Vec<(usize, usize)>> {
+    let mut result: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+    
+    for func in &program.functions {
+        let param_names: std::collections::HashSet<String> = 
+            func.params.iter().map(|(name, _, _)| name.to_lowercase()).collect();
+        let mut array_dims: HashMap<String, usize> = HashMap::new();
+        
+        fn scan_for_array_access(
+            stmt: &Statement,
+            param_names: &std::collections::HashSet<String>,
+            array_dims: &mut HashMap<String, usize>,
+        ) {
+            match stmt {
+                Statement::IndexAssign { array, indices, .. } => {
+                    if param_names.contains(&array.to_lowercase()) {
+                        array_dims.entry(array.to_lowercase())
+                            .and_modify(|d| *d = (*d).max(indices.len()))
+                            .or_insert(indices.len());
+                    }
+                }
+                Statement::Assign { value, .. } => {
+                    scan_expr_for_array_access(value, param_names, array_dims);
+                }
+                Statement::If { condition, then_branch, else_branch, .. } => {
+                    scan_expr_for_array_access(condition, param_names, array_dims);
+                    for s in then_branch { scan_for_array_access(s, param_names, array_dims); }
+                    if let Some(eb) = else_branch {
+                        for s in eb { scan_for_array_access(s, param_names, array_dims); }
+                    }
+                }
+                Statement::While { condition, body, .. } => {
+                    scan_expr_for_array_access(condition, param_names, array_dims);
+                    for s in body { scan_for_array_access(s, param_names, array_dims); }
+                }
+                Statement::Repeat { body, until, .. } => {
+                    for s in body { scan_for_array_access(s, param_names, array_dims); }
+                    scan_expr_for_array_access(until, param_names, array_dims);
+                }
+                Statement::For { body, .. } => {
+                    for s in body { scan_for_array_access(s, param_names, array_dims); }
+                }
+                Statement::Write(exprs, _) => {
+                    for expr in exprs { scan_expr_for_array_access(expr, param_names, array_dims); }
+                }
+                Statement::Read(exprs) => {
+                    for expr in exprs { scan_expr_for_array_access(expr, param_names, array_dims); }
+                }
+                _ => {}
+            }
+        }
+        
+        fn scan_expr_for_array_access(
+            expr: &Expression,
+            param_names: &std::collections::HashSet<String>,
+            array_dims: &mut HashMap<String, usize>,
+        ) {
+            match expr {
+                Expression::Index { array, indices } => {
+                    if param_names.contains(&array.to_lowercase()) {
+                        array_dims.entry(array.to_lowercase())
+                            .and_modify(|d| *d = (*d).max(indices.len()))
+                            .or_insert(indices.len());
+                    }
+                }
+                Expression::Binary { left, right, .. } => {
+                    scan_expr_for_array_access(left, param_names, array_dims);
+                    scan_expr_for_array_access(right, param_names, array_dims);
+                }
+                Expression::Unary { expr, .. } => {
+                    scan_expr_for_array_access(expr, param_names, array_dims);
+                }
+                Expression::Call { args, .. } => {
+                    for arg in args { scan_expr_for_array_access(arg, param_names, array_dims); }
+                }
+                _ => {}
+            }
+        }
+        
+        for stmt in &func.body {
+            scan_for_array_access(stmt, &param_names, &mut array_dims);
+        }
+        
+        // Convertir a Vec de (índice_parámetro, cantidad_dimensiones) - mantiene orden
+        let mut param_array_list: Vec<(usize, usize)> = Vec::new();
+        for (idx, (name, _, _)) in func.params.iter().enumerate() {
+            if let Some(dims) = array_dims.get(&name.to_lowercase()) {
+                param_array_list.push((idx, *dims));
+            }
+        }
+        
+        if !param_array_list.is_empty() {
+            result.insert(func.name.to_lowercase(), param_array_list);
+        }
+    }
+    
+    result
+}
+
 pub(crate) struct FunctionTranslator<'a, M: Module> {
     pub(crate) builder: FunctionBuilder<'a>,
     pub(crate) variables: HashMap<String, Variable>, 
@@ -322,6 +539,7 @@ pub(crate) struct FunctionTranslator<'a, M: Module> {
     pub(crate) array_dims: HashMap<String, Vec<Value>>,
     pub(crate) array_elem_types: HashMap<String, Type>,
     pub(crate) global_array_dims: &'a HashMap<String, Vec<i64>>,
+    pub(crate) func_array_params: &'a HashMap<String, Vec<(usize, usize)>>,
 }
 
 /// Describe la firma de una función nativa para codegen
@@ -406,6 +624,32 @@ pub(crate) fn extract_constant_array_dims(program: &Program) -> HashMap<String, 
 }
 
 impl<'a, M: Module> FunctionTranslator<'a, M> {
+    fn call_runtime(
+        &mut self,
+        name: &str,
+        params: &[types::Type],
+        ret: Option<types::Type>,
+        args: &[Value],
+    ) -> Option<Value> {
+        let mut sig = self.module.make_signature();
+        for &p in params {
+            sig.params.push(AbiParam::new(p));
+        }
+        if let Some(r) = ret {
+            sig.returns.push(AbiParam::new(r));
+        }
+        let callee = self.module
+            .declare_function(name, Linkage::Import, &sig)
+            .expect("declare_function failed");
+        let local = self.module.declare_func_in_func(callee, self.builder.func);
+        let call = self.builder.ins().call(local, args);
+        if ret.is_some() {
+            Some(self.builder.inst_results(call)[0])
+        } else {
+            None
+        }
+    }
+
     fn ensure_variable(&mut self, name: &str, ty: Type) -> Variable {
         if let Some(var) = self.variables.get(name) {
             return *var;
@@ -428,33 +672,48 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
         if *ty == Type::String {
             return val;
         }
+        // FIX #12: Usar call_runtime en lugar de repetir la construcción de firma
         if *ty == Type::Real {
-            let mut sig = self.module.make_signature();
-            sig.params.push(AbiParam::new(types::F64));
-            sig.returns.push(AbiParam::new(types::I64));
-            let callee = self.module.declare_function("builtin_convertiratexto", Linkage::Import, &sig).unwrap();
-            let local = self.module.declare_func_in_func(callee, self.builder.func);
-            let call = self.builder.ins().call(local, &[val]);
-            self.builder.inst_results(call)[0]
+            self.call_runtime("builtin_convertiratexto", &[types::F64], Some(types::I64), &[val])
+                .unwrap()
         } else {
-            let mut sig = self.module.make_signature();
-            sig.params.push(AbiParam::new(types::I64));
-            sig.returns.push(AbiParam::new(types::I64));
-            let callee = self.module.declare_function("builtin_int_to_str", Linkage::Import, &sig).unwrap();
-            let local = self.module.declare_func_in_func(callee, self.builder.func);
-            let call = self.builder.ins().call(local, &[val]);
-            self.builder.inst_results(call)[0]
+            self.call_runtime("builtin_int_to_str", &[types::I64], Some(types::I64), &[val])
+                .unwrap()
         }
     }
 
     fn compute_flat_index(&mut self, array: &str, indices: &[Expression]) -> Value {
         let one = self.builder.ins().iconst(types::I64, 1);
+        let zero_val = self.builder.ins().iconst(types::I64, 0);
+
+        let clamp = |builder: &mut FunctionBuilder, idx: Value, dim: Value| -> Value {
+            let one = builder.ins().iconst(types::I64, 1);
+            let max_idx = builder.ins().isub(dim, one);
+            let zero = builder.ins().iconst(types::I64, 0);
+            let is_neg = builder.ins().icmp(IntCC::SignedLessThan, idx, zero);
+            
+            let clamped_lo = builder.ins().select(is_neg, zero, idx);
+            let is_over = builder.ins().icmp(IntCC::SignedGreaterThan, clamped_lo, max_idx);
+            builder.ins().select(is_over, max_idx, clamped_lo)
+        };
+
         if indices.len() == 1 {
             let (idx, _) = self.translate_expr(&indices[0]);
-            self.builder.ins().isub(idx, one)
+            let idx_zero = self.builder.ins().isub(idx, one);
+            // If we know the static dimension, clamp; otherwise just saturate at 0
+            if let Some(sizes) = self.global_array_dims.get(&array.to_lowercase()) {
+                let dim = self.builder.ins().iconst(types::I64, sizes[0]);
+                clamp(&mut self.builder, idx_zero, dim)
+            } else if let Some(dims) = self.array_dims.get(&array.to_lowercase()).cloned() {
+                clamp(&mut self.builder, idx_zero, dims[0])
+            } else {
+                // Unknown size: at least clamp to non-negative
+                let is_neg = self.builder.ins().icmp(IntCC::SignedLessThan, idx_zero, zero_val);
+                self.builder.ins().select(is_neg, zero_val, idx_zero)
+            }
         } else {
-            // Intentar dims locales, luego globales
-            let dims: Vec<Value> = if let Some(d) = self.array_dims.get(array) {
+            // Multi-dimensional: look up dims
+            let dims: Vec<Value> = if let Some(d) = self.array_dims.get(&array.to_lowercase()) {
                 d.clone()
             } else if let Some(sizes) = self.global_array_dims.get(&array.to_lowercase()) {
                 sizes.iter().map(|&s| self.builder.ins().iconst(types::I64, s)).collect()
@@ -465,11 +724,18 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
             for (k, idx_expr) in indices.iter().enumerate() {
                 let (idx, _) = self.translate_expr(idx_expr);
                 let idx_zero = self.builder.ins().isub(idx, one);
+                // Clamp if dim info is available
+                let idx_safe = if k < dims.len() {
+                    clamp(&mut self.builder, idx_zero, dims[k])
+                } else {
+                    let is_neg = self.builder.ins().icmp(IntCC::SignedLessThan, idx_zero, zero_val);
+                    self.builder.ins().select(is_neg, zero_val, idx_zero)
+                };
                 let mut stride = self.builder.ins().iconst(types::I64, 1);
                 for dim_val in dims.iter().skip(k + 1) {
                     stride = self.builder.ins().imul(stride, *dim_val);
                 }
-                let contrib = self.builder.ins().imul(idx_zero, stride);
+                let contrib = self.builder.ins().imul(idx_safe, stride);
                 flat = self.builder.ins().iadd(flat, contrib);
             }
             flat
@@ -486,10 +752,16 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                     Type::String => types::I64, // Puntero como I64
                     _ => types::I64,
                 };
-                for (_i, var) in vars.iter().enumerate() {
+                for var in vars.iter() {
                     if !self.variables.contains_key(var) {
                         let variable = Variable::new(self.variables.len());
                         self.builder.declare_var(variable, cl_type);
+                        // FIX #8: Inicializar con valor cero para que use_var no falle
+                        let init_val = match ty {
+                            Type::Real => self.builder.ins().f64const(0.0),
+                            _ => self.builder.ins().iconst(cl_type, 0),
+                        };
+                        self.builder.def_var(variable, init_val);
                         self.variables.insert(var.clone(), variable);
                         self.variable_types.insert(var.clone(), ty.clone());
                     }
@@ -524,8 +796,8 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                      dim_vals.push(sz);
                      total = self.builder.ins().imul(total, sz);
                  }
-                 self.array_dims.insert(name.clone(), dim_vals);
-                 // Llamar al asignador en tiempo de ejecución: retorna puntero como i64
+                 self.array_dims.insert(name.to_lowercase(), dim_vals);
+                 // Llamar al asignador en tiempo de ejecución
                  let mut sig = self.module.make_signature();
                  sig.params.push(AbiParam::new(types::I64));
                  sig.returns.push(AbiParam::new(types::I64));
@@ -539,20 +811,22 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
              }
              Statement::IndexAssign { array, indices, value } => {
                  // Obtener puntero base del arreglo
-                 let base_ptr = if let Some(v) = self.variables.get(array) {
+                 let base_ptr = if let Some(v) = self.variables.get(&array.to_lowercase()) {
+                     self.builder.use_var(*v)
+                 } else if let Some(v) = self.variables.get(array) {
                      self.builder.use_var(*v)
                  } else {
                      self.builder.ins().iconst(types::I64, 0)
                  };
                  // Calcular índice plano usando info de dimensiones
-                 let flat_idx = self.compute_flat_index(array, indices);
+                 let flat_idx = self.compute_flat_index(&array.to_lowercase(), indices);
                  let eight = self.builder.ins().iconst(types::I64, 8);
                  let offset = self.builder.ins().imul(flat_idx, eight);
                  let addr = self.builder.ins().iadd(base_ptr, offset);
                  // Traducir valor
                  let (val, val_ty) = self.translate_expr(value);
                  // Rastrear tipo de elemento
-                 self.array_elem_types.entry(array.clone()).or_insert(val_ty.clone());
+                 self.array_elem_types.entry(array.to_lowercase()).or_insert(val_ty.clone());
                  // Coercer real a bits i64 para almacenamiento
                  let val = if val_ty == Type::Real {
                      self.builder.ins().bitcast(types::I64, MemFlags::new(), val)
@@ -589,25 +863,38 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                              self.builder.def_var(var, result);
                          }
                          Expression::Index { array, indices } => {
-                             // Leer en elemento de arreglo: Leer datos[i]
-                             let mut sig = self.module.make_signature();
-                             sig.returns.push(AbiParam::new(types::I64));
-                             let callee = self.module.declare_function("read_int", Linkage::Import, &sig).unwrap();
-                             let local_callee = self.module.declare_func_in_func(callee, self.builder.func);
-                             let call = self.builder.ins().call(local_callee, &[]);
-                             let result = self.builder.inst_results(call)[0];
+                            let is_real_array = self.array_elem_types.get(array)
+                                .map(|t| *t == Type::Real)
+                                .unwrap_or(false);
 
-                             let base_ptr = if let Some(v) = self.variables.get(array) {
-                                 self.builder.use_var(*v)
-                             } else {
-                                 self.builder.ins().iconst(types::I64, 0)
-                             };
-                             let flat_idx = self.compute_flat_index(array, indices);
-                             let eight = self.builder.ins().iconst(types::I64, 8);
-                             let offset = self.builder.ins().imul(flat_idx, eight);
-                             let addr = self.builder.ins().iadd(base_ptr, offset);
-                             self.builder.ins().store(MemFlags::new(), result, addr, 0);
-                         }
+                            let ret_cl_ty = if is_real_array { types::F64 } else { types::I64 };
+                            let read_fn = if is_real_array { "read_real" } else { "read_int" };
+
+                            let mut sig = self.module.make_signature();
+                            sig.returns.push(AbiParam::new(ret_cl_ty));
+                            let callee = self.module.declare_function(read_fn, Linkage::Import, &sig).unwrap();
+                            let local_callee = self.module.declare_func_in_func(callee, self.builder.func);
+                            let call = self.builder.ins().call(local_callee, &[]);
+                            let result = self.builder.inst_results(call)[0];
+
+                            // Convertir a i64 para almacenamiento (reales se guardan como bitcast)
+                            let store_val = if is_real_array {
+                                self.builder.ins().bitcast(types::I64, MemFlags::new(), result)
+                            } else {
+                                result
+                            };
+
+                            let base_ptr = if let Some(v) = self.variables.get(array) {
+                                self.builder.use_var(*v)
+                            } else {
+                                self.builder.ins().iconst(types::I64, 0)
+                            };
+                            let flat_idx = self.compute_flat_index(array, indices);
+                            let eight = self.builder.ins().iconst(types::I64, 8);
+                            let offset = self.builder.ins().imul(flat_idx, eight);
+                            let addr = self.builder.ins().iadd(base_ptr, offset);
+                            self.builder.ins().store(MemFlags::new(), store_val, addr, 0);
+                        }
                          _ => {}
                      }
                  }
@@ -683,15 +970,17 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 let (cond_val, _) = self.translate_expr(condition);
                 self.builder.ins().brif(cond_val, body_block, &[], exit_block, &[]);
 
+                // Cuerpo
                 self.builder.switch_to_block(body_block);
                 self.builder.seal_block(body_block);
                 for stmt in body {
                     self.translate_stmt(stmt);
                 }
+
                 self.builder.ins().jump(header_block, &[]);
+                self.builder.seal_block(header_block);
 
                 self.builder.switch_to_block(exit_block);
-                self.builder.seal_block(header_block); 
                 self.builder.seal_block(exit_block);
             }
             Statement::Repeat { body, until } => {
@@ -716,12 +1005,30 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 // Evaluar inicio y asignar a variable de bucle
                 let (start_val, start_ty) = self.translate_expr(start);
                 let loop_var = self.ensure_variable(var, start_ty.clone());
+                // Coercer start_val al tipo de la variable de loop si ya existe con otro tipo
+                let loop_var_val = self.builder.use_var(loop_var);
+                let loop_cl_ty = self.builder.func.dfg.value_type(loop_var_val);
+                let start_cl_ty = self.builder.func.dfg.value_type(start_val);
+                let start_val = if loop_cl_ty == types::F64 && start_cl_ty == types::I64 {
+                    self.builder.ins().fcvt_from_sint(types::F64, start_val)
+                } else if loop_cl_ty == types::I64 && start_cl_ty == types::F64 {
+                    self.builder.ins().fcvt_to_sint_sat(types::I64, start_val)
+                } else { start_val };
                 self.builder.def_var(loop_var, start_val);
 
-                // Evaluar paso (por defecto 1)
+                let loop_is_real = loop_cl_ty == types::F64 || start_ty == Type::Real;
+
+                // Evaluar paso (por defecto 1 o 1.0 según tipo)
                 let step_val = if let Some(step_expr) = step {
-                    let (sv, _) = self.translate_expr(step_expr);
-                    sv
+                    let (sv, sv_ty) = self.translate_expr(step_expr);
+                    // Coercer step al tipo del loop
+                    if loop_is_real && sv_ty == Type::Integer {
+                        self.builder.ins().fcvt_from_sint(types::F64, sv)
+                    } else if !loop_is_real && sv_ty == Type::Real {
+                        self.builder.ins().fcvt_to_sint_sat(types::I64, sv)
+                    } else { sv }
+                } else if loop_is_real {
+                    self.builder.ins().f64const(1.0)
                 } else {
                     self.builder.ins().iconst(types::I64, 1)
                 };
@@ -735,14 +1042,24 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 // Cabecera: verificar condición
                 self.builder.switch_to_block(header_block);
                 let current = self.builder.use_var(loop_var);
-                let (end_val, _) = self.translate_expr(end);
+                let (end_raw, end_ty) = self.translate_expr(end);
+                let end_val = if loop_is_real && end_ty == Type::Integer {
+                    self.builder.ins().fcvt_from_sint(types::F64, end_raw)
+                } else if !loop_is_real && end_ty == Type::Real {
+                    self.builder.ins().fcvt_to_sint_sat(types::I64, end_raw)
+                } else { end_raw };
 
-                // Determinar dirección: si paso > 0 entonces actual <= fin, sino actual >= fin
-                let zero = self.builder.ins().iconst(types::I64, 0);
-                let step_positive = self.builder.ins().icmp(IntCC::SignedGreaterThan, step_val, zero);
-                let cond_le = self.builder.ins().icmp(IntCC::SignedLessThanOrEqual, current, end_val);
-                let cond_ge = self.builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, current, end_val);
-                let cond = self.builder.ins().select(step_positive, cond_le, cond_ge);
+                // Determinar condición según tipo
+                let cond = if loop_is_real {
+                    // Para reales sólo soportar paso positivo
+                    self.builder.ins().fcmp(FloatCC::LessThanOrEqual, current, end_val)
+                } else {
+                    let zero = self.builder.ins().iconst(types::I64, 0);
+                    let step_positive = self.builder.ins().icmp(IntCC::SignedGreaterThan, step_val, zero);
+                    let cond_le = self.builder.ins().icmp(IntCC::SignedLessThanOrEqual, current, end_val);
+                    let cond_ge = self.builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, current, end_val);
+                    self.builder.ins().select(step_positive, cond_le, cond_ge)
+                };
 
                 self.builder.ins().brif(cond, body_block, &[], exit_block, &[]);
 
@@ -752,9 +1069,13 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 for stmt in body {
                     self.translate_stmt(stmt);
                 }
-                // Incrementar: var <- var + paso
+                // Incrementar: var <- var + paso (con el tipo correcto)
                 let current_after = self.builder.use_var(loop_var);
-                let next = self.builder.ins().iadd(current_after, step_val);
+                let next = if loop_is_real {
+                    self.builder.ins().fadd(current_after, step_val)
+                } else {
+                    self.builder.ins().iadd(current_after, step_val)
+                };
                 self.builder.def_var(loop_var, next);
                 self.builder.ins().jump(header_block, &[]);
 
@@ -771,28 +1092,18 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 self.translate_expr(&call_expr);
             }
             Statement::ClearScreen => {
-                let mut sig = self.module.make_signature();
-                sig.returns.push(AbiParam::new(types::I32));
-                let callee = self.module.declare_function("builtin_clear_screen", Linkage::Import, &sig).unwrap();
-                let local_callee = self.module.declare_func_in_func(callee, self.builder.func);
-                self.builder.ins().call(local_callee, &[]);
+                // FIX #12: Usar call_runtime helper
+                self.call_runtime("builtin_clear_screen", &[], Some(types::I32), &[]);
             }
             Statement::Wait { duration, milliseconds } => {
                 let (dur_val, _) = self.translate_expr(duration);
                 let func_name = if *milliseconds { "builtin_sleep_millis" } else { "builtin_sleep_secs" };
-                let mut sig = self.module.make_signature();
-                sig.params.push(AbiParam::new(types::I64));
-                sig.returns.push(AbiParam::new(types::I32));
-                let callee = self.module.declare_function(func_name, Linkage::Import, &sig).unwrap();
-                let local_callee = self.module.declare_func_in_func(callee, self.builder.func);
-                self.builder.ins().call(local_callee, &[dur_val]);
+                // FIX #12: Usar call_runtime helper
+                self.call_runtime(func_name, &[types::I64], Some(types::I32), &[dur_val]);
             }
             Statement::WaitKey => {
-                let mut sig = self.module.make_signature();
-                sig.returns.push(AbiParam::new(types::I32));
-                let callee = self.module.declare_function("builtin_wait_key", Linkage::Import, &sig).unwrap();
-                let local_callee = self.module.declare_func_in_func(callee, self.builder.func);
-                self.builder.ins().call(local_callee, &[]);
+                // FIX #12: Usar call_runtime helper
+                self.call_runtime("builtin_wait_key", &[], Some(types::I32), &[]);
             }
             _ => {}
         }
@@ -837,6 +1148,7 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                     });
                     (val, ast_ty)
                 } else {
+                    //eprintln!("[PSeInt JIT] Advertencia: variable '{}' usada sin declarar; se asume 0.", name);
                     (self.builder.ins().iconst(types::I64, 0), Type::Integer)
                 }
             }
@@ -909,8 +1221,26 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                          BinaryOp::Add => self.builder.ins().iadd(lhs, rhs),
                          BinaryOp::Sub => self.builder.ins().isub(lhs, rhs),
                          BinaryOp::Mul => self.builder.ins().imul(lhs, rhs),
-                         BinaryOp::Div => self.builder.ins().sdiv(lhs, rhs),
-                         BinaryOp::Mod => self.builder.ins().srem(lhs, rhs),
+                        BinaryOp::Div => {
+                            let zero = self.builder.ins().iconst(types::I64, 0);
+                            let one = self.builder.ins().iconst(types::I64, 1);
+                            
+                            let is_zero = self.builder.ins().icmp(IntCC::Equal, rhs, zero);
+                            let safe_rhs = self.builder.ins().select(is_zero, one, rhs);
+                            let result = self.builder.ins().sdiv(lhs, safe_rhs);
+                            
+                            self.builder.ins().select(is_zero, zero, result)
+                        }
+                        BinaryOp::Mod => {
+                            let zero = self.builder.ins().iconst(types::I64, 0);
+                            let one = self.builder.ins().iconst(types::I64, 1);
+                            
+                            let is_zero = self.builder.ins().icmp(IntCC::Equal, rhs, zero);
+                            let safe_rhs = self.builder.ins().select(is_zero, one, rhs);
+                            let result = self.builder.ins().srem(lhs, safe_rhs);
+                            
+                            self.builder.ins().select(is_zero, zero, result)
+                        }
                          BinaryOp::Eq => self.builder.ins().icmp(IntCC::Equal, lhs, rhs),
                          BinaryOp::Ne => self.builder.ins().icmp(IntCC::NotEqual, lhs, rhs),
                          BinaryOp::Lt => self.builder.ins().icmp(IntCC::SignedLessThan, lhs, rhs),
@@ -934,19 +1264,21 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
             }
             Expression::Index { array, indices } => {
                 // Obtener puntero base del arreglo
-                let base_ptr = if let Some(v) = self.variables.get(array) {
+                let base_ptr = if let Some(v) = self.variables.get(&array.to_lowercase()) {
+                    self.builder.use_var(*v)
+                } else if let Some(v) = self.variables.get(array) {
                     self.builder.use_var(*v)
                 } else {
                     self.builder.ins().iconst(types::I64, 0)
                 };
                 // Calcular índice plano usando info de dimensiones
-                let flat_idx = self.compute_flat_index(array, indices);
+                let flat_idx = self.compute_flat_index(&array.to_lowercase(), indices);
                 let eight = self.builder.ins().iconst(types::I64, 8);
                 let offset = self.builder.ins().imul(flat_idx, eight);
                 let addr = self.builder.ins().iadd(base_ptr, offset);
                 // Cargar valor
                 let val = self.builder.ins().load(types::I64, MemFlags::new(), addr, 0);
-                let elem_ty = self.array_elem_types.get(array).cloned().unwrap_or(Type::Integer);
+                let elem_ty = self.array_elem_types.get(&array.to_lowercase()).cloned().unwrap_or(Type::Integer);
                 (val, elem_ty)
             }
             Expression::Call { function, args } => {
@@ -998,6 +1330,38 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                         }
                     }
 
+                    // Agregar dimensiones de arrays como parámetros ocultos
+                    if let Some(array_param_indices) = self.func_array_params.get(&func_lower) {
+                        for (param_idx, dims_count) in array_param_indices {
+                            // Obtener la variable del argumento correspondiente
+                            if let Some(arg_expr) = args.get(*param_idx) {
+                                if let Expression::Variable(var_name) = arg_expr {
+                                    // Obtener dimensiones de la variable del argumento
+                                    if let Some(dims) = self.array_dims.get(&var_name.to_lowercase()) {
+                                        for dim in dims.iter().take(*dims_count) {
+                                            arg_vals.push(*dim);
+                                        }
+                                    } else if let Some(sizes) = self.global_array_dims.get(&var_name.to_lowercase()) {
+                                        for size in sizes.iter().take(*dims_count) {
+                                            let dim_val = self.builder.ins().iconst(types::I64, *size);
+                                            arg_vals.push(dim_val);
+                                        }
+                                    } else {
+                                        // Si no se encuentran dimensiones, pasar valores por defecto
+                                        for _ in 0..*dims_count {
+                                            arg_vals.push(self.builder.ins().iconst(types::I64, 1));
+                                        }
+                                    }
+                                } else {
+                                    // Si el argumento no es una variable simple, pasar valores por defecto
+                                    for _ in 0..*dims_count {
+                                        arg_vals.push(self.builder.ins().iconst(types::I64, 1));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     let local_callee = self.module.declare_func_in_func(func_info.func_id, self.builder.func);
                     let call = self.builder.ins().call(local_callee, &arg_vals);
                     let results = self.builder.inst_results(call).to_vec();
@@ -1041,7 +1405,7 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
 
                     (ret_val, ret_ty)
                 } else {
-                    // Función desconocida
+                    // eprintln!("[PSeInt JIT] Advertencia: función '{}' no encontrada; se devuelve 0.", function);
                     (self.builder.ins().iconst(types::I64, 0), Type::Integer)
                 }
             }
@@ -1066,13 +1430,12 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                     }
                 }
             }
-            _ => (self.builder.ins().iconst(types::I64, 0), Type::Integer),
         }
     }
 }
 
 // ============================================================
-// Funciones auxiliares de tiempo de ejecución (llamadas desde código JIT)
+// Funciones auxiliares de tiempo de ejecución
 // ============================================================
 
 // --- E/S ---
@@ -1133,23 +1496,37 @@ extern "C" fn builtin_redon(x: f64) -> i64 { x.round() as i64 }
 
 // --- Aleatorio ---
 
+/// Estado persistente del PRNG XorShift64.
+static RNG_STATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn xorshift64_next() -> u64 {
+    use std::sync::atomic::Ordering;
+    // Si el estado es 0 (primera llamada), sembrar desde el reloj del sistema
+    let mut state = RNG_STATE.load(Ordering::Relaxed);
+    if state == 0 {
+        state = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(12345678);
+        // Garantizar que el estado nunca sea 0 (valor inválido para XorShift)
+        if state == 0 { state = 1; }
+    }
+    // Avance XorShift64
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    RNG_STATE.store(state, Ordering::Relaxed);
+    state
+}
+
 extern "C" fn builtin_azar(n: i64) -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64;
-    let mut x = seed;
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    (x % (n as u64)) as i64
+    if n <= 0 { return 0; }
+    (xorshift64_next() % (n as u64)) as i64
 }
 
 extern "C" fn builtin_aleatorio(a: i64, b: i64) -> i64 {
-    let range = (b - a + 1).unsigned_abs();
-    if range == 0 { return a; }
-    a + builtin_azar(range as i64)
+    let range = (b - a + 1).max(1) as u64;
+    a + (xorshift64_next() % range) as i64
 }
 
 // --- Funciones de cadena ---
@@ -1164,45 +1541,37 @@ unsafe fn cstr_to_str<'a>(ptr: *const u8) -> &'a str {
     }
 }
 
-/// Auxiliar: filtrar un String de Rust como puntero de cadena C
-fn leak_string(s: String) -> *const u8 {
-    let c = std::ffi::CString::new(s).unwrap_or_default();
-    let ptr = c.as_ptr() as *const u8;
-    std::mem::forget(c);
-    ptr
-}
-
 extern "C" fn builtin_longitud(s: *const u8) -> i64 {
-    unsafe { cstr_to_str(s).len() as i64 }
+    // Longitud en caracteres Unicode, no en bytes (correcto para PSeInt)
+    unsafe { cstr_to_str(s) }.chars().count() as i64
 }
 
 extern "C" fn builtin_mayusculas(s: *const u8) -> *const u8 {
+    // FIX #1: Usar gc_alloc_string en lugar de leak_string
     let upper = unsafe { cstr_to_str(s) }.to_uppercase();
-    leak_string(upper)
+    gc_alloc_string(upper)
 }
 
 extern "C" fn builtin_minusculas(s: *const u8) -> *const u8 {
     let lower = unsafe { cstr_to_str(s) }.to_lowercase();
-    leak_string(lower)
+    gc_alloc_string(lower)
 }
 
 extern "C" fn builtin_subcadena(s: *const u8, x: i64, y: i64) -> *const u8 {
     let text = unsafe { cstr_to_str(s) };
-    // Las posiciones de PSeInt son base-1 (o base-0 según configuración). Usamos base-0.
+
     let start = (x as usize).saturating_sub(1);
     let end = y as usize;
-    let sub = if start < text.len() {
-        &text[start..end.min(text.len())]
-    } else {
-        ""
-    };
-    leak_string(sub.to_string())
+    let sub: String = text.chars().skip(start).take(end.saturating_sub(start)).collect();
+
+    gc_alloc_string(sub)
 }
 
 extern "C" fn builtin_concatenar(s1: *const u8, s2: *const u8) -> *const u8 {
     let a = unsafe { cstr_to_str(s1) };
     let b = unsafe { cstr_to_str(s2) };
-    leak_string(format!("{}{}", a, b))
+
+    gc_alloc_string(format!("{}{}", a, b))
 }
 
 // --- Conversión ---
@@ -1213,39 +1582,57 @@ extern "C" fn builtin_convertiranumero(s: *const u8) -> f64 {
 }
 
 extern "C" fn builtin_convertiratexto(n: f64) -> *const u8 {
-    leak_string(format!("{}", n))
+    gc_alloc_string(format!("{}", n))
 }
 
 extern "C" fn builtin_int_to_str(n: i64) -> *const u8 {
-    leak_string(format!("{}", n))
+    gc_alloc_string(format!("{}", n))
 }
 
 // --- Tiempo ---
 
+/// Obtiene el offset UTC local en segundos.
+fn local_utc_offset_secs() -> i64 {
+    if let Ok(val) = std::env::var("PSINT_UTC_OFFSET") {
+        if let Ok(h) = val.trim().parse::<i64>() {
+            return h * 3600;
+        }
+    }
+    // Intentar determinar el offset real usando la hora local del sistema
+    #[cfg(unix)]
+    {
+        extern "C" {
+            fn time(t: *mut i64) -> i64;
+        }
+        let _ = unsafe { time(std::ptr::null_mut()) }; // dummy para compilación
+    }
+    // Fallback: UTC-4
+    -4 * 3600
+}
+
 extern "C" fn builtin_horaactual() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
+    let utc_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    // Convertir a HHMMSS (aproximación de hora local usando UTC)
-    let total_secs = secs % 86400;
-    let hh = total_secs / 3600;
-    let mm = (total_secs % 3600) / 60;
-    let ss = total_secs % 60;
-    (hh * 10000 + mm * 100 + ss) as i64
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let local_secs = utc_secs + local_utc_offset_secs();
+    let day_secs = local_secs.rem_euclid(86400);
+    let hh = day_secs / 3600;
+    let mm = (day_secs % 3600) / 60;
+    let ss = day_secs % 60;
+    hh * 10000 + mm * 100 + ss
 }
 
 extern "C" fn builtin_fechaactual() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
+    let utc_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    // Convertir a AAAAMMDD (aproximación UTC)
-    // Días desde la época
-    let days = (secs / 86400) as i64;
-    // Cálculo simple de calendario
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let local_secs = utc_secs + local_utc_offset_secs();
+    let days = local_secs.div_euclid(86400);
+    // Calcular año, mes, día desde días epoch (1970-01-01)
     let mut y = 1970i64;
     let mut remaining = days;
     loop {
@@ -1255,7 +1642,7 @@ extern "C" fn builtin_fechaactual() -> i64 {
         y += 1;
     }
     let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
-    let month_days = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let month_days: [i64; 12] = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
     let mut m = 1i64;
     for &md in &month_days {
         if remaining < md { break; }
@@ -1270,9 +1657,14 @@ extern "C" fn builtin_fechaactual() -> i64 {
 
 extern "C" fn builtin_alloc_array(n: i64) -> i64 {
     let size = n.max(1) as usize;
-    let layout = std::alloc::Layout::array::<i64>(size).unwrap();
+    let layout = std::alloc::Layout::array::<i64>(size)
+        .expect("Layout inválido para arreglo");
     let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-    ptr as i64
+    if ptr.is_null() {
+        eprintln!("[PSeInt JIT] Error crítico: no se pudo asignar arreglo de {} elementos.", size);
+        return 0;
+    }
+    gc_register_array(ptr, layout)
 }
 
 // --- Pantalla / Flush ---

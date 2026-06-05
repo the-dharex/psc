@@ -1,4 +1,3 @@
-
 //! Pase de optimización a nivel AST.
 
 use crate::ast::*;
@@ -31,21 +30,16 @@ pub fn optimize(program: &mut Program, stats: &mut OptStats) {
 }
 
 fn optimize_block(stmts: &mut Vec<Statement>, stats: &mut OptStats) {
-    // 1. Optimizar expresiones y sub-bloques de cada sentencia
     for stmt in stmts.iter_mut() {
         optimize_stmt(stmt, stats);
     }
 
-    // 2. Eliminación de código muerto: eliminar sentencias después de bucles infinitos incondicionales
-    //    o después de un retorno, y eliminar ramas If vacías
     let original_len = stmts.len();
     eliminate_dead_code(stmts);
     stats.dead_stmts_removed += original_len.saturating_sub(stmts.len());
 
-    // 3. Propagación de constantes (simple: rastrear constantes conocidas en código lineal)
     propagate_constants(stmts, stats);
 
-    // 4. Re-plegar después de la propagación
     for stmt in stmts.iter_mut() {
         fold_stmt_exprs(stmt, stats);
     }
@@ -433,7 +427,15 @@ fn propagate_constants(stmts: &mut Vec<Statement>, stats: &mut OptStats) {
     let mut known: HashMap<String, Expression> = HashMap::new();
 
     for stmt in stmts.iter_mut() {
-        // Primero, sustituir constantes conocidas en expresiones de esta sentencia
+        match stmt {
+            Statement::While { .. } | Statement::Repeat { .. }
+            | Statement::For { .. } | Statement::Match { .. } => {
+                known.clear();
+            }
+            _ => {}
+        }
+
+        // Sustituir constantes conocidas en expresiones de esta sentencia
         substitute_in_stmt(stmt, &known, stats);
 
         match stmt {

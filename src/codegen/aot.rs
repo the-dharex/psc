@@ -110,6 +110,7 @@ impl AotCodeGenerator {
             builder.switch_to_block(entry_block);
             builder.seal_block(entry_block);
 
+            let empty_func_array_params: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
             let mut trans = FunctionTranslator {
                 builder,
                 variables: HashMap::new(),
@@ -120,6 +121,7 @@ impl AotCodeGenerator {
                 array_dims: HashMap::new(),
                 array_elem_types: HashMap::new(),
                 global_array_dims: &global_array_dims,
+                func_array_params: &empty_func_array_params,
             };
 
             for stmt in &program.main_body {
@@ -203,6 +205,7 @@ impl AotCodeGenerator {
                 variable_types.insert(ret_var.clone(), func.return_type.clone().unwrap_or(Type::Integer));
             }
 
+            let empty_func_array_params: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
             let mut trans = FunctionTranslator {
                 builder,
                 variables,
@@ -213,6 +216,7 @@ impl AotCodeGenerator {
                 array_dims: HashMap::new(),
                 array_elem_types: HashMap::new(),
                 global_array_dims,
+                func_array_params: &empty_func_array_params,
             };
 
             for stmt in &func.body {

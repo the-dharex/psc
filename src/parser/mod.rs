@@ -26,7 +26,7 @@ pub fn parser() -> impl Parser<Token, Program, Error = Simple<Token>> {
                 .or(
                     // Array index: ident[idx1, idx2, ...]
                     expr.clone()
-                        .separated_by(just(Token::Comma))
+                        .separated_by(just(Token::Comma)) 
                         .delimited_by(just(Token::LBracket), just(Token::RBracket))
                         .map(|indices| (false, indices)) // false = índice
                 )
